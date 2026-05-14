@@ -1,0 +1,89 @@
+// Embed API — permite que uma página "hospedeira" (aula do curso) controle
+// o áudio do Corvino via postMessage, sem precisar duplicar synth/SF2.
+//
+// Mensagens aceitas (window.postMessage):
+//   { type: 'corvino:noteOn',  midi: 48, isBass: false, velocity: 100 }
+//   { type: 'corvino:noteOff', midi: 48, isBass: false }
+//   { type: 'corvino:allOff' }            // solta todas as notas ativas
+//   { type: 'corvino:resume' }            // desbloqueia AudioContext suspenso
+//   { type: 'corvino:ping' }              // handshake; responde { type: 'corvino:pong' }
+//
+// A aula hospedeira responde a 'corvino:pong' pra saber que o engine está
+// pronto (splash terminou, SF2 carregado). Até receber o pong, os
+// exemplos sonoros ficam desabilitados.
+
+import * as audio from './audio-engine.js';
+import { state } from './state.js';
+import * as pcKeyboard from './pc-keyboard.js';
+
+const active = new Set(); // "midi:isBass" — pra all-off
+
+function onMessage(ev) {
+  const d = ev.data;
+  if (!d || typeof d !== 'object' || typeof d.type !== 'string') return;
+  if (!d.type.startsWith('corvino:')) return;
+
+  try {
+    switch (d.type) {
+      case 'corvino:ping':
+        ev.source?.postMessage({ type: 'corvino:pong' }, '*');
+        break;
+      case 'corvino:resume':
+        // Aluno pode disparar Synthesia via Space no parent (atalho global)
+        // SEM nunca ter clicado no iframe. 2 cenários a defender:
+        //   (a) AudioContext em estado 'suspended' → resume() destranca
+        //   (b) Canais MIDI descalibrados (programSelect perdeu efeito) →
+        //       ensureChannelsReady() reatribui SF aos canais como faz
+        //       setTimbre. Reproduz o "fix" que o aluno faz manualmente
+        //       trocando de timbre.
+        audio.resume();
+        audio.ensureChannelsReady();
+        break;
+      case 'corvino:noteOn': {
+        // Defensivo: garante resume antes de cada noteOn. HOT PATH manteve-se
+        // sem resume por performance (ver audio-engine.js noteOn), mas aqui
+        // estamos numa borda externa onde vale a tentativa.
+        audio.resume();
+        const vel = typeof d.velocity === 'number' ? d.velocity : 100;
+        audio.noteOn(d.midi, vel, !!d.isBass);
+        // Feedback visual nas próprias teclas do app também
+        if (d.isBass) state.bassNoteOn(d.midi);
+        else state.pianoNoteOn(d.midi);
+        // Acende a tecla virtual no PC keyboard (pra que Synthesia das aulas
+        // funcione igual no modo PC — aluno vê acender mesmo sem Corvino físico)
+        pcKeyboard.setActiveByMidi(d.midi, !!d.isBass, true);
+        active.add(`${d.midi}:${!!d.isBass}`);
+        break;
+      }
+      case 'corvino:noteOff':
+        audio.noteOff(d.midi, !!d.isBass);
+        if (d.isBass) state.bassNoteOff(d.midi);
+        else state.pianoNoteOff(d.midi);
+        pcKeyboard.setActiveByMidi(d.midi, !!d.isBass, false);
+        active.delete(`${d.midi}:${!!d.isBass}`);
+        break;
+      case 'corvino:allOff':
+        for (const key of active) {
+          const [midiStr, isBassStr] = key.split(':');
+          const midi = parseInt(midiStr, 10);
+          const isBass = isBassStr === 'true';
+          audio.noteOff(midi, isBass);
+          if (isBass) state.bassNoteOff(midi);
+          else state.pianoNoteOff(midi);
+          pcKeyboard.setActiveByMidi(midi, isBass, false);
+        }
+        active.clear();
+        break;
+    }
+  } catch (err) {
+    console.error('[corvino embed-api]', err);
+  }
+}
+
+export function init() {
+  window.addEventListener('message', onMessage);
+  // Anuncia que a API está online (caso a aula esteja aguardando)
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage({ type: 'corvino:ready' }, '*');
+  }
+}
